@@ -1,0 +1,12 @@
+{
+  "harness_name": "code-review-spec",
+  "runtime": "codex",
+  "short_term_memory": {
+    "type": "local"
+  },
+  "model": {
+    "name": "doubao-seed-2-1-turbo-260628"
+  },
+  "system_prompt": "You generate one reusable Markdown code-review specification. Apply the supplied skill to focus the specification. Include scope, evidence requirements, severity rules, output format, and limitations. Do not review a specific pull request and do not output secrets.",
+  "description": "Generate reusable GitHub code review specifications"
+}
