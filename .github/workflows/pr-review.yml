@@ -59,12 +59,25 @@ jobs:
               ]
             }')"
 
-          response="$(curl --fail-with-body --silent --show-error \
+          if ! response="$(curl --fail-with-body --silent --show-error \
             --request POST "${PR_SERVER_URL%/}/v1/pr-reviews" \
             --header "Authorization: Bearer ${PR_SERVER_API_KEY}" \
             --header 'Content-Type: application/json' \
             --header "Idempotency-Key: ${{ github.repository }}:${PR_NUMBER}:${HEAD_SHA}" \
-            --data "$payload")"
+            --data "$payload")"; then
+            echo "PR Server submission failed."
+            if jq -e . >/dev/null 2>&1 <<<"$response"; then
+              jq -c '{
+                code: (.code // .error.code // .ResponseMetadata.Error.Code // null),
+                error: (if (.error | type) == "string" then .error else null end),
+                message: (.message // .ResponseMetadata.Error.Message // null),
+                request_id: (.request_id // .requestId // .ResponseMetadata.RequestId // null)
+              }' <<<"$response"
+            else
+              echo "PR Server returned a non-JSON error response."
+            fi
+            exit 1
+          fi
 
           poll_url="$(jq -r '.poll_url // empty' <<<"$response")"
           if [[ -z "$poll_url" ]]; then
