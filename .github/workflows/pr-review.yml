@@ -1,0 +1,109 @@
+name: Codex dual review
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  submit-and-wait:
+    # GitHub does not expose Actions Secrets to PRs from external forks.
+    # Keep the first version limited to branches in this repository.
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Read approved review specifications
+        uses: actions/checkout@v4
+        with:
+          # Never accept a PR author's modified SPEC as the review policy.
+          ref: main
+          sparse-checkout: SPEC
+
+      - name: Submit the two review jobs
+        id: submit
+        env:
+          PR_SERVER_URL: ${{ secrets.PR_SERVER_URL }}
+          PR_SERVER_API_KEY: ${{ secrets.PR_SERVER_API_KEY }}
+          REPOSITORY: https://github.com/${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          if [[ -z "$PR_SERVER_URL" || -z "$PR_SERVER_API_KEY" ]]; then
+            echo "PR_SERVER_URL and PR_SERVER_API_KEY must be configured as Actions Secrets."
+            exit 1
+          fi
+
+          payload="$(jq -n \
+            --arg repository "$REPOSITORY" \
+            --argjson pr_number "$PR_NUMBER" \
+            --arg head_sha "$HEAD_SHA" \
+            --rawfile general_spec SPEC/general-review.md \
+            --rawfile security_spec SPEC/security-review.md \
+            '{
+              repository: $repository,
+              pr_number: $pr_number,
+              head_sha: $head_sha,
+              reviews: [
+                {id: "general", spec: $general_spec},
+                {id: "security", spec: $security_spec}
+              ]
+            }')"
+
+          response="$(curl --fail-with-body --silent --show-error \
+            --request POST "${PR_SERVER_URL%/}/v1/pr-reviews" \
+            --header "Authorization: Bearer ${PR_SERVER_API_KEY}" \
+            --header 'Content-Type: application/json' \
+            --header "Idempotency-Key: ${{ github.repository }}:${PR_NUMBER}:${HEAD_SHA}" \
+            --data "$payload")"
+
+          poll_url="$(jq -r '.poll_url // empty' <<<"$response")"
+          if [[ -z "$poll_url" ]]; then
+            echo "PR Server did not return poll_url."
+            exit 1
+          fi
+          echo "poll_url=$poll_url" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for both Codex Sandbox reviews
+        env:
+          PR_SERVER_URL: ${{ secrets.PR_SERVER_URL }}
+          PR_SERVER_API_KEY: ${{ secrets.PR_SERVER_API_KEY }}
+          POLL_URL: ${{ steps.submit.outputs.poll_url }}
+        shell: bash
+        run: |
+          for attempt in {1..60}; do
+            response="$(curl --fail-with-body --silent --show-error \
+              --header "Authorization: Bearer ${PR_SERVER_API_KEY}" \
+              "${PR_SERVER_URL%/}${POLL_URL}")"
+            status="$(jq -r '.status // empty' <<<"$response")"
+            echo "PR Server status: $status"
+
+            case "$status" in
+              completed)
+                exit 0
+                ;;
+              partial_failed|failed)
+                echo "$response" | jq .
+                exit 1
+                ;;
+              queued|running)
+                sleep 10
+                ;;
+              *)
+                echo "Unexpected PR Server response: $response"
+                exit 1
+                ;;
+            esac
+          done
+
+          echo "Timed out waiting for PR Server."
+          exit 1
