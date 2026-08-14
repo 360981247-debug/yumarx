@@ -1,0 +1,6 @@
+agentkit-sdk-python>=0.8.1
+google-adk>=1.21.0
+httpx>=0.28.1
+python-dotenv>=1.2.2
+veadk-python>=1.1.0
+# google-adk
