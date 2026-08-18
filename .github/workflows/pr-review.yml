@@ -29,8 +29,22 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           sparse-checkout: review-specs
 
+      - name: Detect initial policy bootstrap
+        id: policies
+        shell: bash
+        run: |
+          if [[ -s review-specs/general.md && -s review-specs/security.md ]]; then
+            echo 'available=true' >> "$GITHUB_OUTPUT"
+          else
+            # The PR that first introduces this workflow also introduces the
+            # immutable policies. They become available after it is merged.
+            echo 'available=false' >> "$GITHUB_OUTPUT"
+            echo 'Review policies are not on the default branch yet; skipping bootstrap PR.'
+          fi
+
       - name: Submit the immutable review task
         id: submit
+        if: ${{ steps.policies.outputs.available == 'true' }}
         env:
           PR_SERVER_URL: ${{ secrets.PR_SERVER_URL }}
           PR_SERVER_API_KEY: ${{ secrets.PR_SERVER_API_KEY }}
@@ -72,6 +86,7 @@ jobs:
 
       - name: Poll and validate both strategy results
         id: result
+        if: ${{ steps.policies.outputs.available == 'true' }}
         env:
           PR_SERVER_URL: ${{ secrets.PR_SERVER_URL }}
           PR_SERVER_API_KEY: ${{ secrets.PR_SERVER_API_KEY }}
@@ -120,6 +135,7 @@ jobs:
           echo "result_file=$result_file" >> "$GITHUB_OUTPUT"
 
       - name: Create or update the two PR comments
+        if: ${{ steps.policies.outputs.available == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
