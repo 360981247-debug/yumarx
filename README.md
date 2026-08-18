@@ -2,6 +2,12 @@
 
 这是“做好被集成：Code Review 场景实战”文档中 **Beginner** 路径的实现：
 
+## 双策略 PR 评审工作流
+
+`review-specs/general.md` 与 `review-specs/security.md` 是固定的评审依据；GitHub Actions 仅从
+默认分支读取它们。配置 `PR_SERVER_URL` 和 `PR_SERVER_API_KEY` 两个 Repository Secret 后，PR 工作流会
+提交任务、轮询两项结果，并以幂等标记更新两条 PR 评论。
+
 - `pr_reader` 工具从 GitHub REST API 读取公共 PR 的元数据、文件 diff 与行级评论；
 - VeADK Agent 必须先调用工具，再用中文 Markdown 给出基于证据的代码评审；
 - 使用 AgentKit 的流式应用入口，可直接部署到 AgentKit Runtime。

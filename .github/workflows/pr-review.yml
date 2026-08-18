@@ -1,35 +1,50 @@
-name: Codex dual review
+name: Dual-strategy PR review
 
 on:
   pull_request:
-    branches: [main]
     types: [opened, reopened, synchronize]
 
 permissions:
   contents: read
+  pull-requests: write
 
 concurrency:
-  group: codex-review-${{ github.event.pull_request.number }}
+  group: pr-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
-  submit-and-wait:
-    # GitHub does not expose Actions Secrets to PRs from external forks.
-    # Keep the first version limited to branches in this repository.
+  submit-wait-and-comment:
+    # Repository secrets are intentionally unavailable to pull_request events from
+    # forks. Do not replace this with pull_request_target: that would run
+    # untrusted PR content with write credentials.
     if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
-      - name: Read approved review specifications
+      - name: Check out approved review policies
         uses: actions/checkout@v4
         with:
-          # Never accept a PR author's modified SPEC as the review policy.
-          ref: main
-          sparse-checkout: SPEC
+          # Never let a PR change the policy used to review itself.
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: review-specs
 
-      - name: Submit the two review jobs
+      - name: Detect initial policy bootstrap
+        id: policies
+        shell: bash
+        run: |
+          if [[ -s review-specs/general.md && -s review-specs/security.md ]]; then
+            echo 'available=true' >> "$GITHUB_OUTPUT"
+          else
+            # The PR that first introduces this workflow also introduces the
+            # immutable policies. They become available after it is merged.
+            echo 'available=false' >> "$GITHUB_OUTPUT"
+            echo 'Review policies are not on the default branch yet; skipping bootstrap PR.'
+          fi
+
+      - name: Submit the immutable review task
         id: submit
+        if: ${{ steps.policies.outputs.available == 'true' }}
         env:
           PR_SERVER_URL: ${{ secrets.PR_SERVER_URL }}
           PR_SERVER_API_KEY: ${{ secrets.PR_SERVER_API_KEY }}
@@ -38,8 +53,9 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         shell: bash
         run: |
+          set -euo pipefail
           if [[ -z "$PR_SERVER_URL" || -z "$PR_SERVER_API_KEY" ]]; then
-            echo "PR_SERVER_URL and PR_SERVER_API_KEY must be configured as Actions Secrets."
+            echo "Missing required secrets: PR_SERVER_URL and PR_SERVER_API_KEY."
             exit 1
           fi
 
@@ -47,8 +63,8 @@ jobs:
             --arg repository "$REPOSITORY" \
             --argjson pr_number "$PR_NUMBER" \
             --arg head_sha "$HEAD_SHA" \
-            --rawfile general_spec SPEC/general-review.md \
-            --rawfile security_spec SPEC/security-review.md \
+            --rawfile general_spec review-specs/general.md \
+            --rawfile security_spec review-specs/security.md \
             '{
               repository: $repository,
               pr_number: $pr_number,
@@ -63,33 +79,33 @@ jobs:
             --request POST "${PR_SERVER_URL%/}/v1/pr-reviews" \
             --header "Authorization: Bearer ${PR_SERVER_API_KEY}" \
             --header 'Content-Type: application/json' \
-            --header "Idempotency-Key: ${{ github.repository }}:${PR_NUMBER}:${HEAD_SHA}" \
+            --header "Idempotency-Key: ${GITHUB_REPOSITORY}:${PR_NUMBER}:${HEAD_SHA}" \
             --data "$payload")"
+          job_id="$(jq -er '.job_id' <<<"$response")"
+          echo "job_id=$job_id" >> "$GITHUB_OUTPUT"
 
-          poll_url="$(jq -r '.poll_url // empty' <<<"$response")"
-          if [[ -z "$poll_url" ]]; then
-            echo "PR Server did not return poll_url."
-            exit 1
-          fi
-          echo "poll_url=$poll_url" >> "$GITHUB_OUTPUT"
-
-      - name: Wait for both Codex Sandbox reviews
+      - name: Poll and validate both strategy results
+        id: result
+        if: ${{ steps.policies.outputs.available == 'true' }}
         env:
           PR_SERVER_URL: ${{ secrets.PR_SERVER_URL }}
           PR_SERVER_API_KEY: ${{ secrets.PR_SERVER_API_KEY }}
-          POLL_URL: ${{ steps.submit.outputs.poll_url }}
+          JOB_ID: ${{ steps.submit.outputs.job_id }}
         shell: bash
         run: |
-          for attempt in {1..60}; do
+          set -euo pipefail
+          result_file="$RUNNER_TEMP/pr-review-result.json"
+          for attempt in {1..120}; do
             response="$(curl --fail-with-body --silent --show-error \
               --header "Authorization: Bearer ${PR_SERVER_API_KEY}" \
-              "${PR_SERVER_URL%/}${POLL_URL}")"
-            status="$(jq -r '.status // empty' <<<"$response")"
-            echo "PR Server status: $status"
+              "${PR_SERVER_URL%/}/v1/pr-reviews/${JOB_ID}")"
+            status="$(jq -er '.status' <<<"$response")"
+            echo "Attempt ${attempt}: ${status}"
 
             case "$status" in
               completed)
-                exit 0
+                printf '%s' "$response" > "$result_file"
+                break
                 ;;
               partial_failed|failed)
                 echo "$response" | jq .
@@ -105,5 +121,57 @@ jobs:
             esac
           done
 
-          echo "Timed out waiting for PR Server."
-          exit 1
+          if [[ ! -s "$result_file" ]]; then
+            echo "Timed out waiting for PR Server task ${JOB_ID}."
+            exit 1
+          fi
+          jq -e '
+            .status == "completed" and
+            ([.reviews[] |
+              select((.id == "general" or .id == "security") and
+                     .status == "completed" and
+                     (.body | type == "string" and length > 0))] | length == 2)
+          ' "$result_file" >/dev/null
+          echo "result_file=$result_file" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update the two PR comments
+        if: ${{ steps.policies.outputs.available == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RESULT_FILE: ${{ steps.result.outputs.result_file }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for review_id in general security; do
+            case "$review_id" in
+              general) title='通用代码评审' ;;
+              security) title='安全代码评审' ;;
+            esac
+
+            result="$(jq -er --arg id "$review_id" '.reviews[] | select(.id == $id) | .body' "$RESULT_FILE")"
+            marker="<!-- pr-review-server:${review_id}:${HEAD_SHA} -->"
+            payload_file="$RUNNER_TEMP/${review_id}-comment.json"
+            jq -n \
+              --arg marker "$marker" \
+              --arg title "$title" \
+              --arg sha "$HEAD_SHA" \
+              --arg result "$result" \
+              '{body: ($marker + "\n## " + $title + "\n\n评审提交：`" + $sha + "`\n\n" + $result)}' \
+              > "$payload_file"
+
+            existing_comment_id="$(gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" \
+              --jq ".[] | select(.body | contains(\"${marker}\")) | .id" \
+              | head -n 1 || true)"
+            if [[ -n "$existing_comment_id" ]]; then
+              gh api --method PATCH \
+                "repos/${GITHUB_REPOSITORY}/issues/comments/${existing_comment_id}" \
+                --input "$payload_file" >/dev/null
+            else
+              gh api --method POST \
+                "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+                --input "$payload_file" >/dev/null
+            fi
+          done
